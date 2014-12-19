@@ -16,6 +16,7 @@ import struct
 import time
 import sys
 import cv
+import cv2
 import socket
 
 import os
@@ -25,23 +26,28 @@ import pygame.midi
 from pygame.locals import *
 
 from Axon.Component import component
+from Axon.AdaptiveCommsComponent import AdaptiveCommsComponent
 from Axon.Ipc import shutdownMicroprocess
 from Axon.Scheduler import scheduler
 
 from Kamaelia.Chassis.Pipeline import Pipeline
+from Kamaelia.Chassis.Graphline import Graphline
+from Kamaelia.Util.Console import ConsoleEchoer
+
+from pprint import pprint
 
 
-IP = "matelight.cbrp3.c-base.org"
-PORT = 1337
-RESX = 40
-RESY = 16
-KAMERA_NR = 0
-TOTAL_PIXELS = RESX * RESY
-FRAMES_PER_SECOND = 50
-TIME_BETWEEN_FRAMES = 1.0 / FRAMES_PER_SECOND
+# IP = "matelight.cbrp3.c-base.org"
+#PORT = 1337
+#RESX = 40
+#RESY = 16
+#KAMERA_NR = 0
+#TOTAL_PIXELS = RESX * RESY
+#FRAMES_PER_SECOND = 50
+#TIME_BETWEEN_FRAMES = 1.0 / FRAMES_PER_SECOND
 
-screennames = ['bitwiglogo.png', '1up.png', 'text-B.png', 'text-bit.png', 'text-wig.png', 'rauschen.png']
-screens = {}
+#screennames = ['bitwiglogo.png', '1up.png', 'text-B.png', 'text-bit.png', 'text-wig.png', 'rauschen.png']
+#screens = {}
 
 
 class ImageRepository(component):
@@ -78,9 +84,50 @@ class ImageRepository(component):
             yield 1
 
 
+class MidiRouter(AdaptiveCommsComponent):
+    def __init__(self, routing={}):
+        super(MidiRouter, self).__init__()
+
+        self.routing = routing
+
+        for boxname in routing.itervalues():
+            self.addOutbox(boxname)
+
+    def finished(self):
+        while self.dataReady("control"):
+            msg = self.recv("control")
+            if type(msg) in (shutdownMicroprocess):
+                self.send(msg, "signal")
+                return True
+        return False
+
+
+    def main(self):
+        while not self.finished():
+            while not self.dataReady("inbox"):
+                self.pause()
+                yield 1
+
+            while self.dataReady("inbox"):
+                midiinput = self.recv("inbox")
+
+                chan = midiinput[0][1]
+                val = midiinput[0][2]
+
+                if chan in self.routing.keys():
+                    self.send(val, self.routing[chan])
+
+                yield 1
+
+            yield 1
+
+
+
 class MidiInput(component):
-    def __init__(self, device_id=None):
+    def __init__(self, device_id=None, debug=True):
         super(MidiInput, self).__init__()
+
+        self.debug = debug
 
         pygame.midi.init()
 
@@ -89,13 +136,13 @@ class MidiInput(component):
         if not device_id:
             self.midi_device = pygame.midi.get_default_input_id()
         else:
-            self.midi_device = device_id
+            self.midi_device = int(device_id)
 
         try:
             self.midi = pygame.midi.Input(self.midi_device, 0)
-        except Exception as e:
+        except pygame.midi.MidiException as e:
             print("ERR: Could not open midi input device %s" % self.midi_device)
-            print("ERR: Exception ", e)
+            print("ERR: Exception ", e.__dict__)
             sys.exit()
 
         print "INFO: Opened midi input device %s" % self.midi_device
@@ -128,8 +175,17 @@ class MidiInput(component):
         while not self.finished():
             if self.midi.poll():
                 while self.midi.poll():
-                    print("Received midi data!")
+
                     mididata = self.midi.read(1)
+                    if len(mididata) > 1:
+                        mididata = mididata[-1]
+                    else:
+                        mididata = mididata[0]
+
+                    if self.debug:
+                        print(mididata)
+
+
 
                     self.send(mididata, "outbox")
                     yield 1
@@ -140,7 +196,7 @@ class MidiInput(component):
 class CVCamera(component):
     def __init__(self, device_id=0):
         super(CVCamera, self).__init__()
-        self.cam = cv.CaptureFromCAM(device_id)
+        self.cam = cv2.VideoCapture(device_id)
 
 
     def finished(self):
@@ -154,15 +210,16 @@ class CVCamera(component):
 
     def main(self):
         while not self.finished():
-            frame = cv.QueryFrame(self.cam)
-            if not frame:
+            err, frame = self.cam.read()  # cv.QueryFrame(self.cam)
+            # frame = cv.CreateImage((40, 16), cv.IPL_DEPTH_8U, 3)
+            if not err:
                 print("Oh, no camera attached! Change this and rerun!")
                 sys.exit()
 
-            mlframe = cv.CreateImage((40, 16), cv.IPL_DEPTH_8U, frame.channels)
-            gr = frame[128: 384, 0: 640]  # Crop from x, y, w, h -> 100, 200, 100, 200
+            mlframe = cv2.im  # ((40, 16), cv.IPL_DEPTH_8U, 3)
+            #gr = frame[128: 384, 0: 640]  # Crop from x, y, w, h -> 100, 200, 100, 200
 
-            cv.Resize(gr, mlframe)
+            cv2.Resize(frame, mlframe)
             self.send(mlframe, "outbox")
 
             yield 1
@@ -194,6 +251,8 @@ class Matelight(component):
             print("Meeeh: ", e)
 
     def main(self):
+        self.framecount = 0
+        self.lasttime = 0
         while not self.finished():
 
             while not self.anyReady():
@@ -204,6 +263,11 @@ class Matelight(component):
                 frame = self.recv("inbox")
 
                 self.cmd_send_image(frame, 100, 100)
+                self.framecount += 1
+                if time.time() >= self.lasttime + 1:
+                    print(self.framecount)
+                    self.framecount = 0
+                    self.lasttime = time.time()
 
             yield 1
 
@@ -211,11 +275,16 @@ class Matelight(component):
 class ColorFilter(component):
     Inboxes = {'inbox': "Image input",
                'control': "Control input",
-               'color': "RGB percentage (0-100) tuple: (r,g,b)"}
+               'red': "Filter red hue",
+               'green': "Filter green hue",
+               'blue': "Filter blue hue",
+               "brightness": "Filter Brightness",
+               "gamma": "Filter Gamma"
+    }
 
-    def __init__(self, color=(100, 100, 100)):
+    def __init__(self, settings=[100, 100, 100, 100, 100]):
         super(ColorFilter, self).__init__()
-        self.color = color
+        self.settings = settings
 
     def finished(self):
         while self.dataReady("control"):
@@ -232,9 +301,16 @@ class ColorFilter(component):
                 self.pause()
                 yield 1
 
-            while self.dataReady("color"):
+            while self.anyReady():
                 # Hmm, maybe only get the last message and clear the queue? Could be faster
-                self.color = self.recv("color")
+
+                for no, param in enumerate(['red', 'green', 'blue', 'brightness', 'gamma']):
+                    if self.dataReady(param):
+                        self.settings[no] = self.recv(param)
+                        print(self.settings)
+
+                if self.dataReady("inbox"):
+                    break
 
             while self.dataReady("inbox"):
                 frame = self.recv("inbox")
@@ -243,9 +319,9 @@ class ColorFilter(component):
 
                 for row in xrange(mat.rows):
                     for column in xrange(mat.cols):
-                        red = int(mat[row, column][2] * self.color[0] / 100.0)
-                        green = int(mat[row, column][1] * self.color[1] / 100.0)
-                        blue = int(mat[row, column][0] * self.color[2] / 100.0)
+                        red = int(mat[row, column][2] * self.settings[0] / 127.0)
+                        green = int(mat[row, column][1] * self.settings[1] / 127.0)
+                        blue = int(mat[row, column][0] * self.settings[2] / 127.0)
                         bitstring.extend(struct.pack('BBB', red, green, blue))
 
                 self.send(bytearray(bitstring), "outbox")
@@ -435,10 +511,33 @@ def main():
     #myapp = MyForm(device_id=3)
     #myapp.show()
     #sys.exit(app.exec_())
+    #
+    # Pipe = Pipeline(CVCamera(),
+    # ColorFilter(settings=(100, 100, 100, 100, 100)),
+    #                 Matelight()
+    # ).activate()
 
-    Pipe = Pipeline(CVCamera(),
-                    ColorFilter(color=(0, 100, 0)),
-                    Matelight()
+    MidiPipe = Graphline(CAM=CVCamera(),
+                         ML=Matelight(),
+                         MI=MidiInput(5),
+                         MR=MidiRouter({2: 'red',
+                                        3: 'green',
+                                        4: 'blue',
+                                        14: 'brightness',
+                                        15: 'gamma'}
+                         ),
+                         CF=ColorFilter(),
+                         CE=ConsoleEchoer(),
+                         linkages={
+                             ("MI", "outbox"): ("MR", "inbox"),
+                             ("MR", "red"): ("CF", "red"),
+                             ("MR", "green"): ("CF", "green"),
+                             ("MR", "blue"): ("CF", "blue"),
+                             ("MR", "brightness"): ("CF", "brightness"),
+                             ("MR", "gamma"): ("CF", "gamma"),
+                             ("CAM", "outbox"): ("CF", "inbox"),
+                             ("CF", "outbox"): ("ML", "inbox")
+                         }
     ).activate()
 
     scheduler.run.runThreads()
